@@ -1,0 +1,935 @@
+from flask import Flask, jsonify, send_from_directory, abort, render_template, session, redirect, request, url_for, flash, send_file, Response
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
+from PIL import Image
+import io
+import os
+import time
+import json
+import pyheif
+import config
+import random
+import string
+import hashlib
+import importlib
+import logging
+import requests
+from captcha.image import ImageCaptcha
+from instaloader import Instaloader, Post
+from logging.handlers import RotatingFileHandler
+
+app = Flask(__name__, static_folder="static", template_folder="templates")
+app.secret_key = "removed"
+
+# Mock user credentials (hashed password)
+USERS = {
+    removed
+}
+
+
+# Suppress access logs but keep error logs
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.WARNING)
+
+# Configure Flask logger to propagate to Gunicorn
+gunicorn_logger = logging.getLogger("gunicorn.error")
+app.logger.handlers = gunicorn_logger.handlers
+app.logger.setLevel(gunicorn_logger.level)
+
+# Prevent Flask logger from propagating to the root logger
+app.logger.propagate = False
+
+# Set global logging level for additional debugging (adjust as needed)
+logging.basicConfig(level=logging.INFO)
+
+# Use the configuration parameters
+IMAGES_PER_PAGE = config.IMAGES_PER_PAGE
+UPLOAD_FOLDER = config.IMAGES_FOLDER
+THUMBNAIL_FOLDER = config.THUMBNAILS_FOLDER
+STATIC_FOLDER = config.STATIC_FOLDER
+
+for folder in [UPLOAD_FOLDER, THUMBNAIL_FOLDER]:
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+
+# / B E F O R E __ R E Q U E S T
+# Route to block sensitive files and dynamically load configuration
+
+@app.before_request
+def before_request_setup():
+    # Define restricted extensions and files
+    restricted_extensions = [".py", ".sh", ".pem", ".env", ".config", ".log"]
+    restricted_files = ["key.pem", "cert.pem"]
+
+    # Block access to restricted extensions
+    if any(request.path.endswith(ext) for ext in restricted_extensions):
+        abort(403)
+
+    # Block access to specific sensitive files
+    if any(request.path.endswith(file) for file in restricted_files):
+        abort(403)
+
+    # Dynamic configuration logic
+    global config, UPLOAD_FOLDER, THUMBNAIL_FOLDER, IMAGES_PER_PAGE
+
+    # Get the username from the session (defaults to "Guest")
+    username = session.get("username", "Guest")
+
+    # Dynamically load the configuration based on the username
+    if username == "removed":
+        config = importlib.import_module("config_username")
+    else:
+        config = importlib.import_module("config")  # Default to admin/public config
+
+    # Update global folder variables
+    IMAGES_PER_PAGE = config.IMAGES_PER_PAGE
+    UPLOAD_FOLDER = config.IMAGES_FOLDER
+    THUMBNAIL_FOLDER = config.THUMBNAILS_FOLDER
+
+# / G A L L E R Y __ R O U T E /
+
+@app.route('/gallery/')
+def public_gallery():
+    username = session.get('username', 'Guest')
+    is_authenticated = session.get('is_authenticated', False)
+    is_admin = username in ["admin", "user1"]  # Both are considered admin-like
+    thumbnails_folder = f"/{os.path.basename(THUMBNAIL_FOLDER)}"
+
+    # Generate a secure token for public access if the user is not authenticated
+    access_token = None
+    if not is_authenticated:
+        access_token = generate_token()
+        session["access_token"] = access_token 
+    else:
+        session["access_token"] = ""
+    #app.logger.info(f"Access token for unauthenticated users: {access_token}")
+
+    return render_template(
+        'index.html',
+        is_authenticated=is_authenticated,
+        is_admin=is_admin,
+        username=username,
+        thumbnails_folder=thumbnails_folder,
+        access_token=generate_token() if not is_authenticated else "",
+    )
+
+
+# / C A P T C H A __ R O U T E S /
+
+CAPTCHA_EXPIRATION_MINUTES = 1  # Expiration time for CAPTCHA
+
+@app.route('/gallery/generate-captcha', methods=['GET'])
+def generate_captcha():
+    try:
+        image = ImageCaptcha()
+        captcha_text = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        session['captcha'] = {
+            'text': captcha_text,
+            'timestamp': datetime.now().isoformat()  # Store timestamp for expiration
+        }
+        data = image.generate(captcha_text)
+        return send_file(data, mimetype='image/png')
+    except Exception as e:
+        app.logger.error(f"Error in generate_captcha: {e}")
+        return "Internal Server Error", 500
+
+# Validate Captcha Input
+@app.route("/validate-captcha", methods=["POST"])
+def validate_captcha():
+    user_input = request.form.get("captcha_input", "")
+    captcha_data = session.get("captcha", {})
+
+    if not captcha_data:
+        return jsonify({"success": False, "message": "Captcha expired. Please reload."})
+
+    stored_captcha = captcha_data.get("text", "")
+    captcha_timestamp = captcha_data.get("timestamp", "")
+
+    # Check expiration
+    if captcha_timestamp:
+        captcha_time = datetime.fromisoformat(captcha_timestamp)
+        if datetime.now() > captcha_time + timedelta(minutes=CAPTCHA_EXPIRATION_MINUTES):
+            session.pop("captcha", None)  # Remove expired CAPTCHA
+            return jsonify({"success": False, "message": "Captcha expired. Please reload."})
+
+    # Validate CAPTCHA text
+    if user_input.upper() == stored_captcha:
+        return jsonify({"success": True, "message": "Captcha validated successfully!"})
+    else:
+        return jsonify({"success": False, "message": "Captcha validation failed!"})
+
+
+# / S E C U R I T Y __ L O G G E R /
+
+# Set up a logger for security-related events
+
+security_logger = logging.getLogger("security")
+security_logger.setLevel(logging.INFO)  # Log info and above
+
+# Use RotatingFileHandler to manage log size and backups
+security_handler = RotatingFileHandler("gallery_security.log", maxBytes=1000000, backupCount=5)
+security_handler.setLevel(logging.INFO)
+
+# Add a formatter with timestamps
+formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+security_handler.setFormatter(formatter)
+
+# Add the handler to the logger
+security_logger.addHandler(security_handler)
+
+
+# / L O G I N __ R O U T E /
+
+@app.route("/gallery/login/", methods=["POST"])
+def login():
+    username = request.form.get("username")
+    password = request.form.get("password")
+    user_captcha = request.form.get("captcha")
+
+    # Verify CAPTCHA
+    captcha_data = session.get('captcha', {})
+    if not captcha_data:
+        security_logger.warning(f"Captcha expired. Failed login attempt from IP {request.remote_addr}")
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return jsonify({"success": False, "error": "Captcha expired. Try again."}), 400
+        flash("Captcha expired. Try again.", "error")
+        return redirect(url_for("login"))
+
+    stored_captcha = captcha_data.get("text", "")
+    captcha_timestamp = captcha_data.get("timestamp", "")
+
+    # Check CAPTCHA expiration
+    if captcha_timestamp:
+        captcha_time = datetime.fromisoformat(captcha_timestamp)
+        if datetime.now() > captcha_time + timedelta(minutes=CAPTCHA_EXPIRATION_MINUTES):
+            session.pop("captcha", None)  # Clear expired CAPTCHA
+            security_logger.warning(f"Captcha expired. Failed login attempt from IP {request.remote_addr}")
+            if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+                return jsonify({"success": False, "error": "Captcha expired. Try again."}), 400
+            flash("Captcha expired. Try again.", "error")
+            return redirect(url_for("login"))
+
+    # Check CAPTCHA text
+    if user_captcha.upper() != stored_captcha:
+        security_logger.warning(f"Invalid CAPTCHA. Failed login attempt for user '{username}' from IP {request.remote_addr}")
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return jsonify({"success": False, "error": "Invalid CAPTCHA. Try again."}), 400
+        flash("Invalid CAPTCHA. Try again.", "error")
+        return redirect(url_for("login"))
+
+    # Verify credentials
+    if username in USERS and check_password_hash(USERS[username], password):
+        session["username"] = username
+        session["is_authenticated"] = True
+        session["is_admin"] = username in ["admin", "user1"]  # Set admin status
+        session.pop("captcha", None)  # Clear CAPTCHA on successful login
+
+        # Log successful login
+        security_logger.info(f"Successful login for user '{username}' from IP {request.remote_addr}")
+
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return jsonify({"success": True, "message": "Login successful!"})
+
+        # Otherwise, redirect to the public gallery
+        return redirect(url_for("public_gallery"))
+
+    # Invalid credentials
+    security_logger.warning(f"Invalid credentials. Failed login attempt for user '{username}' from IP {request.remote_addr}")
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return jsonify({"success": False, "error": "Invalid credentials. Try again."}), 400
+    flash("Invalid credentials. Try again.", "error")
+    return redirect(url_for("login"))
+
+
+# / L O G O U T __ R O U T E /
+
+@app.route("/gallery/logout/")
+def logout():
+    session.clear()
+    return redirect(url_for("public_gallery"))
+
+
+
+# / L I S T __ I M A G E S __ R O U T E /
+
+@app.route('/images', methods=['GET'])
+def list_images():
+    try:
+        # Parameters for filtering and pagination
+        page = int(request.args.get('page', 1))
+        search = request.args.get('search', '').lower()
+        sort_method = request.args.get('sort') or config.SORTING_METHOD  # Explicitly set default sort if missing
+        media_type = request.args.get('mediaType', 'all').lower()
+
+        app.logger.debug(f"Sorting method applied: {sort_method}, Search query: '{search}', Media type: {media_type}")
+
+        # Use os.walk to traverse the directory tree
+        all_files = []
+        for root, _, files in os.walk(UPLOAD_FOLDER):
+            for file in files:
+                if media_type == 'photos' and file.lower().endswith(('jpg', 'jpeg', 'png', 'bmp', 'webp')):
+                    all_files.append(os.path.relpath(os.path.join(root, file), UPLOAD_FOLDER))
+                elif media_type == 'videos' and file.lower().endswith(('mp4', 'mov')):
+                    all_files.append(os.path.relpath(os.path.join(root, file), UPLOAD_FOLDER))
+                elif media_type == 'all' and file.lower().endswith(('jpg', 'jpeg', 'png', 'bmp', 'webp', 'mp4', 'mov')):
+                    all_files.append(os.path.relpath(os.path.join(root, file), UPLOAD_FOLDER))
+
+        # Apply search filter
+        if search:
+            all_files = [f for f in all_files if search in f.lower()]
+            app.logger.debug(f"Filtered files for search '{search}': {len(all_files)} files found")
+
+        # Ensure thumbnails exist
+        for img in all_files:
+            if not isinstance(img, str):
+                app.logger.error(f"Invalid image path in all_images: {img}, Type: {type(img)}")
+                continue  # Skip invalid entries
+
+            if img.lower().endswith(('jpg', 'jpeg', 'png', 'bmp', 'webp')):  # Ensure it's an image
+                thumbnail_path = os.path.join(THUMBNAIL_FOLDER, img)
+                original_path = os.path.join(UPLOAD_FOLDER, img)
+                thumbnail_dir = os.path.dirname(thumbnail_path)
+
+                if not os.path.exists(thumbnail_dir):
+                    os.makedirs(thumbnail_dir)
+
+                if not os.path.exists(thumbnail_path):
+                    app.logger.info(f"Creating thumbnail for: {original_path}")
+                    create_thumbnail(original_path, thumbnail_path)
+
+        # Apply sorting
+        if sort_method == 'A-Z':
+            all_files = sorted(all_files)
+        elif sort_method == 'Newest First':
+            all_files = sorted(all_files, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_FOLDER, f)), reverse=True)
+        elif sort_method == 'Oldest First':
+            all_files = sorted(all_files, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_FOLDER, f)))
+        elif sort_method == 'Last Uploaded':
+            all_files = sorted(all_files, key=lambda f: os.path.getctime(os.path.join(UPLOAD_FOLDER, f)), reverse=True)
+
+        # Pagination logic
+        total_files = len(all_files)
+        total_pages = (total_files + IMAGES_PER_PAGE - 1) // IMAGES_PER_PAGE
+        start = (page - 1) * IMAGES_PER_PAGE
+        end = start + IMAGES_PER_PAGE
+        paginated_files = all_files[start:end]
+
+        app.logger.debug(f"Pagination Debug: Total filtered files: {total_files}, Total pages: {total_pages}, Current page: {page}, Start index: {start}, End index: {end}, Paginated files count: {len(paginated_files)}")
+
+        return jsonify({
+            'images': [{'path': file} for file in paginated_files],
+            'total_pages': (len(all_files) + IMAGES_PER_PAGE - 1) // IMAGES_PER_PAGE
+        })
+    except Exception as e:
+        app.logger.error(f"Error in /images: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+
+# / S A N I T I Z E __ I M A G E S /
+# Sanitize Images before uploading to gallery
+
+def sanitize_image(file, output_path, file_name=None):
+    """Sanitize the uploaded image by removing metadata and converting .heic files if necessary."""
+    try:
+        # Use provided file_name if available (for file-like objects)
+        file_name = file_name or getattr(file, 'filename', None)
+
+        # Detect the actual file format using Pillow
+        with Image.open(file) as img:
+            file_format = img.format
+
+        # If the file is HEIF but incorrectly named, process as HEIF
+        if file_format == "JPEG" and file_name and file_name.lower().endswith('.heic'):
+            app.logger.warning(
+                f"File {file_name} is labeled as .heic but is actually JPEG. Processing as JPEG."
+            )
+        
+        # Handle .heic files only if the format is truly HEIF
+        if file_name and file_name.lower().endswith('.heic') and file_format == "HEIF":
+            import pyheif
+            file.seek(0)  # Reset file pointer to the beginning
+            heif_file = pyheif.read(file.read())  # Read the file-like object
+            image = Image.frombytes(
+                heif_file.mode,
+                heif_file.size,
+                heif_file.data,
+                "raw",
+                heif_file.mode,
+                heif_file.stride,
+            )
+            output_path = output_path.rsplit('.', 1)[0] + '.jpg'  # Ensure .jpg extension
+            image = image.convert("RGB")  # Convert to RGB
+            image.save(output_path, "JPEG", quality=95)
+        else:
+            # Handle other formats
+            file.seek(0)  # Reset file pointer to the beginning
+            with Image.open(file) as img:
+                img = img.convert("RGB")  # Ensure the image is in RGB mode
+                img.save(output_path, "JPEG", quality=95)
+    except Exception as e:
+        app.logger.error(f"Error sanitizing image: {e}")
+        raise e
+
+
+# / U P L O A D __ R O U T E /
+# Route to upload images and videos
+@app.route('/upload', methods=['POST'])
+def upload_files():
+    try:
+        images_folder = session.get("IMAGES_FOLDER", config.IMAGES_FOLDER)
+        thumbnails_folder = session.get("THUMBNAILS_FOLDER", config.THUMBNAILS_FOLDER)
+
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file part'}), 400
+
+        files = request.files.getlist('file')
+        if not files or all(file.filename == '' for file in files):
+            return jsonify({'error': 'No selected files'}), 400
+
+        messages = []
+
+        for file in files:
+            if file:
+                if file.filename.lower().endswith(('jpg', 'png', 'jpeg', 'bmp', 'webp', 'heic')):
+                    # Handle image upload
+                    sanitized_path = os.path.join(images_folder, file.filename)
+
+                    if os.path.exists(sanitized_path):
+                        messages.append(f"File {file.filename} already exists. Skipping upload.")
+                        continue
+
+                    sanitize_image(file, sanitized_path)
+                    thumbnail_path = os.path.join(thumbnails_folder, file.filename)
+                    create_thumbnail(sanitized_path, thumbnail_path)
+
+                    messages.append(f"Image {file.filename} uploaded successfully")
+                elif file.filename.lower().endswith(('mp4', 'mov', 'avi', 'wmv', 'mkv')):
+                    # Handle video upload
+                    video_path = os.path.join(images_folder, file.filename)
+
+                    if os.path.exists(video_path):
+                        messages.append(f"File {file.filename} already exists. Skipping upload.")
+                        continue
+
+                    file.save(video_path)
+                    messages.append(f"Video {file.filename} uploaded successfully")
+                else:
+                    messages.append(f"File {file.filename} is not a valid image or video")
+
+            else:
+                messages.append(f"File is not valid or empty")
+
+        return jsonify({'messages': messages}), 200
+
+    except Exception as e:
+        app.logger.error(f"Error uploading files: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# / D E L E T E __ R O U T E __ M O D A L /
+# Route to delete the image from the modal
+
+@app.route('/delete-image', methods=['POST'])
+def delete_image():
+    try:
+        # Check if the user is an admin
+        username = session.get("username", "Guest")
+        is_admin = session.get("is_admin", False)
+
+        if not is_admin:
+            app.logger.warning(f"Unauthorized delete attempt by user: {username}")
+            return jsonify({'error': 'Unauthorized action. Admin access is required.'}), 403
+
+        # Parse the request data
+        data = request.json
+        image_path = data.get('image_path', '').strip()  # Relative path of the image
+
+        if not image_path:
+            return jsonify({'error': 'Image path is missing'}), 400
+
+        # Absolute paths for the image and thumbnail
+        image_full_path = os.path.join(UPLOAD_FOLDER, image_path)
+        thumbnail_full_path = os.path.join(THUMBNAIL_FOLDER, image_path)
+
+        # Delete the image
+        if os.path.exists(image_full_path):
+            os.remove(image_full_path)
+            app.logger.info(f"Deleted media: {image_full_path}")
+        else:
+            app.logger.warning(f"Image not found: {image_full_path}")
+
+        # Call cleanup_thumbnails to remove orphaned thumbnails and empty directories
+        orphaned_count = cleanup_thumbnails(UPLOAD_FOLDER, THUMBNAIL_FOLDER)
+
+        # Clean up empty directories in both images and thumbnails folders
+        cleanup_empty_directories(UPLOAD_FOLDER)
+        cleanup_empty_directories(THUMBNAIL_FOLDER)
+
+        return jsonify({
+            'message': f"Media and associated data deleted successfully. {orphaned_count} orphaned thumbnails cleaned."
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Error in /delete-image: {e}")
+        return jsonify({'error': 'Failed to delete image'}), 500
+
+
+# / C L E A N U P __ T H U M B N A I L S __ R O U T E /
+# Route to trigger the cleanup of thumbnails
+
+@app.route('/cleanup-thumbnails', methods=['POST'])
+def cleanup_thumbnails_route():
+    try:
+        orphaned_count = cleanup_thumbnails(
+            session.get("IMAGES_FOLDER", config.IMAGES_FOLDER),
+            session.get("THUMBNAILS_FOLDER", config.THUMBNAILS_FOLDER),
+        )
+        
+        # Clean up empty directories in both images and thumbnails folders
+        cleanup_empty_directories(session.get("IMAGES_FOLDER", config.IMAGES_FOLDER))
+        cleanup_empty_directories(session.get("THUMBNAILS_FOLDER", config.THUMBNAILS_FOLDER))
+        
+        message = f"Orphaned thumbnails and empty dirs cleaned up successfully. Total cleaned: {orphaned_count}"
+        app.logger.info(message)
+        return jsonify({'message': message, 'orphan_count': orphaned_count}), 200
+    except Exception as e:
+        app.logger.error(f"Error during thumbnail cleanup via route: {e}")
+        return jsonify({'error': f"An error occurred: {str(e)}"}), 500
+
+
+# / S E R V E __ P R O T E C T E D __ T H U M B N A I L S /
+# Route to serve protected thumbnails
+
+@app.route('/protected-thumbnail/<path:filename>', methods=['GET'])
+def serve_protected_thumbnail(filename):
+    try:
+        username = session.get('username', 'Guest')
+        is_authenticated = session.get('is_authenticated', False)
+
+        # Validate access token for unauthenticated users
+        if not is_authenticated:
+            token = request.args.get('token')
+            expected_token = session.get("access_token", "")
+
+            if not token or token != expected_token:
+                abort(403)  # Forbidden
+
+        # Dynamically set the thumbnail folder based on the session or default
+        thumbnail_folder = session.get("THUMBNAIL_FOLDER", THUMBNAIL_FOLDER)
+
+        # Serve the thumbnail (now handles subdirectories with <path>)
+        return send_from_directory(thumbnail_folder, filename)
+
+    except Exception as e:
+        app.logger.error(f"Error in /protected-thumbnail: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# / S E R V E __ P R O T E C T E D __ I M A G E S /
+# Route to serve protected original images
+
+@app.route('/protected-image/<path:filename>', methods=['GET'])
+def serve_protected_image(filename):
+    try:
+        username = session.get('username', 'Guest')
+        is_authenticated = session.get('is_authenticated', False)
+
+        # Validate access token for unauthenticated users
+        if not is_authenticated:
+            token = request.args.get('token')
+            expected_token = session.get("access_token", "")
+
+            if not token or token != expected_token:
+                abort(403)  # Forbidden
+
+        # Dynamically set the image folder based on the session or default
+        image_folder = session.get("IMAGES_FOLDER", UPLOAD_FOLDER)
+
+        # Log the request details
+        app.logger.debug(f"Serving file: {filename} from folder: {image_folder}")
+
+        # Serve the file and add custom headers
+        response = send_from_directory(image_folder, filename)
+
+        # Set explicit MIME type for videos
+        if filename.lower().endswith('.mp4'):
+            response.headers['Content-Type'] = 'video/mp4'
+        elif filename.lower().endswith('.mov'):
+            response.headers['Content-Type'] = 'video/quicktime'
+
+        # Add CORS headers to allow cross-origin requests
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+        return response
+
+    except Exception as e:
+        app.logger.error(f"Error in /protected-image: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# / R A N D O M __ P H O T O __ R O U T E /
+# Route to fetch a Random photo on shuffle
+
+@app.route('/random-photo', methods=['GET'])
+def random_photo():
+    try:
+        images = [
+            os.path.relpath(os.path.join(root, file), config.IMAGES_FOLDER)
+            for root, _, files in os.walk(config.IMAGES_FOLDER)
+            for file in files if file.lower().endswith(('.jpg', '.jpeg', '.png', '.gif'))
+        ]
+
+        if images:
+            from random import choice
+            random_image = choice(images)  # Choose a random image
+            return jsonify({"photo_url": f"/protected-image/{random_image}"})
+        else:
+            return jsonify({"error": "No images available"}), 404
+    except Exception as e:
+        app.logger.error(f"Error in /random-photo: {e}")
+        return jsonify({"error": "Failed to fetch random photo"}), 500
+
+
+
+# / R E G E N E R A T E __ T H U M B N A I L S __ A C T I O N /
+# Route to regenerate missing thumbnails
+
+@app.route('/regenerate-thumbnails', methods=['POST'])
+def regenerate_thumbnails():
+    """Regenerate thumbnails for all images in the upload folder."""
+    try:
+        all_images = []
+        for root, _, files in os.walk(UPLOAD_FOLDER):
+            for file in files:
+                if file.lower().endswith(('jpg', 'jpeg', 'png', 'bmp', 'webp')):
+                    relative_path = os.path.relpath(os.path.join(root, file), UPLOAD_FOLDER)
+                    all_images.append(relative_path)
+
+        regenerated_count = 0
+        for img in all_images:
+            thumbnail_path = os.path.join(THUMBNAIL_FOLDER, img)
+            original_path = os.path.join(UPLOAD_FOLDER, img)
+            thumbnail_dir = os.path.dirname(thumbnail_path)
+
+            if not os.path.exists(thumbnail_dir):
+                os.makedirs(thumbnail_dir)
+
+            # Regenerate the thumbnail
+            create_thumbnail(original_path, thumbnail_path)
+            regenerated_count += 1
+
+        return jsonify({"message": f"Regenerated {regenerated_count} thumbnails"}), 200
+    except Exception as e:
+        app.logger.error(f"Error regenerating thumbnails: {e}")
+        return jsonify({"error": "Failed to regenerate thumbnails"}), 500
+
+
+
+# / C R E A T E __ T H U M B N A I L S /
+# Function to create thumbnails
+
+def create_thumbnail(source_path, thumbnail_path, size=(200, 200)):
+    try:
+        # Create subdirectory for the thumbnail if it doesn't exist
+        thumbnail_dir = os.path.dirname(thumbnail_path)
+        if not os.path.exists(thumbnail_dir):
+            os.makedirs(thumbnail_dir)
+
+        # Open the image and create the thumbnail
+        with Image.open(source_path) as img:
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            img.thumbnail(size, Image.Resampling.LANCZOS)
+            img.save(thumbnail_path, "JPEG", quality=75)
+    except Exception as e:
+        app.logger.error(f"Error creating thumbnail: {e}")
+        raise
+
+
+# / C L E A N U P __ O R P H A N __ T H U M B N A I L S /
+# Function to clean up orphan thumbnails
+
+def cleanup_thumbnails(images_folder, thumbnails_folder):
+    """
+    Delete orphaned thumbnails and any empty subfolders from the thumbnails folder.
+    """
+    orphan_count = 0
+    try:
+        # Collect all valid image paths relative to `images_folder`
+        existing_images = set(
+            os.path.relpath(os.path.join(root, file), images_folder).lower()
+            for root, _, files in os.walk(images_folder) for file in files
+        )
+
+        # Walk through all subdirectories and files in the thumbnails folder
+        for root, _, files in os.walk(thumbnails_folder, topdown=False):  # Bottom-up for folder cleanup
+            for thumbnail in files:
+                thumbnail_path = os.path.join(root, thumbnail)
+                relative_path = os.path.relpath(thumbnail_path, thumbnails_folder).lower()
+
+                # Check if the thumbnail corresponds to an existing image
+                if relative_path not in existing_images:
+                    os.remove(thumbnail_path)
+                    orphan_count += 1
+
+            # Remove empty subfolders
+            if not os.listdir(root):  # Check if directory is empty
+                os.rmdir(root)
+
+        # Return the count of orphaned thumbnails
+        return orphan_count
+    except Exception as e:
+        app.logger.error(f"Error during thumbnail cleanup: {e}")
+        raise
+
+
+# / C L E A N U P __ E M P T Y __ D I R E C T O R I E S /
+# Function to clean up empty directories
+
+def cleanup_empty_directories(folder):
+    """
+    Recursively remove empty directories from a given folder.
+    """
+    try:
+        for root, dirs, files in os.walk(folder, topdown=False):  # Bottom-up to handle nested directories
+            if not os.listdir(root):  # If the directory is empty
+                os.rmdir(root)  # Remove the empty directory
+                app.logger.info(f"Removed empty directory: {root}")
+    except Exception as e:
+        app.logger.error(f"Error during directory cleanup: {e}")
+
+
+# / T O K E N __ V A L I D A T I O N /
+# Secure Token Utiliy Functions
+
+def generate_token():
+    """Generate a secure token for public access."""
+    timestamp = str(int(time.time()))
+    raw_data = f"{timestamp}:{app.secret_key}"
+    return hashlib.sha256(raw_data.encode()).hexdigest()
+
+def validate_token(token):
+    """Validate a secure token."""
+    # Recreate the token based on the current timestamp and compare
+    expected_token = generate_token()
+    return token == expected_token
+    #app.logger.info(f"Token received: {token}, Expected: {ACCESS_TOKEN}")
+
+
+# / S E T T I N G S __ U P D A T E __ T O __ C O N F I G /
+
+# Endpoint to fetch settings based on logged-in user
+@app.route('/get-settings')
+def get_settings():
+    if not session.get('username'):
+        return jsonify({'message': 'User not logged in'}), 401
+
+    return jsonify({
+        'imagesPerPage': IMAGES_PER_PAGE,
+    })
+
+# Endpoint to update configuration
+@app.route('/update-config', methods=['POST'])
+def update_config():
+    if not session.get('username'):
+        return jsonify({'message': 'Unauthorized'}), 401
+
+    key = request.json.get('key')
+    value = request.json.get('value')
+
+    print(f'Received update request for {key}: {value}')  # Log statement
+
+    global config
+
+    try:
+        if key == 'IMAGES_PER_PAGE':
+            config.IMAGES_PER_PAGE = int(value)
+        else:
+            return jsonify({'message': 'Invalid key provided'}), 400
+
+        # Save changes to config file without overwriting other parameters
+        with open(f'{config.__file__}', 'w') as f:
+            f.write(f"# Configuration parameters\n")
+            f.write(f"IMAGES_PER_PAGE = {config.IMAGES_PER_PAGE}\n")
+            f.write(f"\n")
+            f.write(f"# Set Folders\n")
+            f.write(f"STATIC_FOLDER = '{config.STATIC_FOLDER}'\n")
+            f.write(f"IMAGES_FOLDER = '{config.IMAGES_FOLDER}'\n")
+            f.write(f"THUMBNAILS_FOLDER = '{config.THUMBNAILS_FOLDER}'\n")
+            f.write(f"METADATA_FILE = '{config.METADATA_FILE}'\n")
+            f.write(f"\n")
+            f.write(f"# Sorting options: 'A-Z', 'Newest First', 'Oldest First', 'Last Uploaded'\n")
+            f.write(f"SORTING_METHOD = '{config.SORTING_METHOD}'\n")
+            f.write(f"\n")
+            f.write(f"# Gallery access port and IP access\n")
+            f.write(f"FLASK_PORT = {config.FLASK_PORT}\n")
+            f.write(f"FLASK_HOST = '{config.FLASK_HOST}'\n")
+            f.write(f"\n")
+            f.write(f"# SSL config\n")
+            f.write(f"SSL_CERT_PATH = '{config.SSL_CERT_PATH}'\n")
+            f.write(f"SSL_KEY_PATH = '{config.SSL_KEY_PATH}'\n")
+
+        # Restart Gunicorn using subprocess
+        subprocess.run(['sh', 'start_gunicorn.sh'])
+
+        return jsonify({'message': 'Config updated successfully.'})
+    except Exception as e:
+        return jsonify({'message': f'Error updating config: {str(e)}'}), 500
+
+
+# / I N S T A G R A M __ R O U T E S /
+# Instagram Preview Route
+
+@app.route('/instagram-preview', methods=['POST'])
+def instagram_preview():
+    """Fetch preview URLs for a single Instagram post, including photos and videos."""
+    app.logger.info("Instagram preview route called")
+    try:
+        data = request.json
+        ig_url = data.get("url", "").strip()
+        app.logger.info(f"Received URL: {ig_url}")
+
+        # Extract the shortcode from the URL
+        shortcode = ig_url.rstrip('/').split('/')[-1]
+        app.logger.info(f"Extracted shortcode: {shortcode}")
+
+        # Initialize Instaloader without a session
+        loader = Instaloader()
+        post = Post.from_shortcode(loader.context, shortcode)
+
+        # Extract all media URLs (photos/videos)
+        media_urls = []
+        try:
+            # Check if the post has sidecar nodes (carousel posts)
+            if post.typename == 'GraphSidecar':
+                sidecar_nodes = list(post.get_sidecar_nodes())
+                for node in sidecar_nodes:
+                    if node.is_video and hasattr(node, 'video_url') and node.video_url:
+                        media_urls.append({"type": "video", "url": node.video_url})
+                    elif hasattr(node, 'display_url') and node.display_url:
+                        media_urls.append({"type": "image", "url": node.display_url})
+                    else:
+                        app.logger.warning(f"Skipping node with missing URLs: {node}")
+            else:
+                # Single post (fallback for non-carousel posts)
+                if post.is_video and post.video_url:
+                    media_urls = [{"type": "video", "url": post.video_url}]
+                else:
+                    media_urls = [{"type": "image", "url": post.url}]
+
+        except Exception as e:
+            app.logger.error(f"Error extracting media URLs: {e}")
+            media_urls = [{"type": "video" if post.is_video else "image", "url": post.video_url or post.url}]
+
+        app.logger.info(f"Extracted {len(media_urls)} media URLs")
+        return jsonify({"media_urls": media_urls}), 200
+
+    except Exception as e:
+        app.logger.error(f"Error in /instagram-preview: {e}")
+        return jsonify({"error": "Failed to fetch Instagram content"}), 500
+
+
+# Instagram Import Route
+@app.route('/instagram-import', methods=['POST'])
+def instagram_import():
+    """Import selected media (photos/videos) from Instagram and save with profile_date_utc format."""
+    try:
+        data = request.json
+        post_url = data.get("post_url", "").strip()
+        selected_media = data.get("media", [])  # List of selected media objects with 'type' and 'url'
+
+        if not post_url or not selected_media:
+            app.logger.error("Missing post_url or media in the request.")
+            return jsonify({"error": "No post URL or media selected"}), 400
+
+        # Extract the shortcode from the post URL
+        shortcode = post_url.rstrip('/').split('/')[-1]
+
+        # Fetch metadata for the post
+        loader = Instaloader()
+        post = Post.from_shortcode(loader.context, shortcode)
+        profile = post.owner_username
+        date_utc = post.date_utc.strftime("%Y-%m-%d_%H-%M-%S")
+
+        images_folder = session.get("IMAGES_FOLDER", config.IMAGES_FOLDER)
+        thumbnails_folder = session.get("THUMBNAILS_FOLDER", config.THUMBNAILS_FOLDER)
+        saved_media = []
+
+        for media_item in selected_media:
+            try:
+                media_type = media_item.get("type")
+                media_url = media_item.get("url")
+
+                # Determine file extension based on type
+                extension = ".mp4" if media_type == "video" else ".jpg"
+                profile_folder = os.path.join(images_folder, profile)
+                if not os.path.exists(profile_folder):
+                    os.makedirs(profile_folder)
+
+                # Generate a unique filename for each selected media
+                unique_filename = f"{profile}_{date_utc}_{selected_media.index(media_item) + 1}{extension}"
+                local_path = os.path.join(profile_folder, unique_filename)
+
+                if not os.path.exists(local_path):
+                    response = requests.get(media_url, stream=True)
+                    if response.status_code == 200:
+                        with open(local_path, "wb") as file:
+                            for chunk in response.iter_content(1024):
+                                file.write(chunk)
+
+                        # Generate a thumbnail for images only
+                        if media_type == "image":
+                            thumbnail_folder = os.path.join(thumbnails_folder, profile)
+                            if not os.path.exists(thumbnail_folder):
+                                os.makedirs(thumbnail_folder)
+                            thumbnail_path = os.path.join(thumbnail_folder, unique_filename)
+                            create_thumbnail(local_path, thumbnail_path)
+
+                        saved_media.append(local_path)
+                    else:
+                        app.logger.error(f"Failed to download media: {media_url}")
+                else:
+                    app.logger.info(f"Media {unique_filename} already exists, skipping download.")
+
+            except Exception as e:
+                app.logger.error(f"Error processing media {media_item}: {e}")
+
+        return jsonify({"message": f"Imported {len(saved_media)} media files", "files": saved_media}), 200
+
+    except Exception as e:
+        app.logger.error(f"Error in /instagram-import: {e}")
+        return jsonify({"error": "Internal Server Error"}), 500
+
+
+
+# Proxy Route for Instagram
+@app.route('/proxy-image', methods=['GET'])
+def proxy_image():
+    image_url = request.args.get('url')
+    if not image_url:
+        return jsonify({"error": "Missing image URL"}), 400
+
+    try:
+        response = requests.get(image_url, stream=True)
+        if response.status_code == 200:
+            return Response(response.content, content_type=response.headers['Content-Type'])
+        else:
+            return jsonify({"error": "Failed to fetch image"}), 500
+    except Exception as e:
+        app.logger.error(f"Error in /proxy-image: {e}")
+        return jsonify({"error": "Internal Server Error"}), 500
+
+
+
+# / S S L __ C O N T E X T /
+# SSL Context for running app
+
+ssl_context = (config.SSL_CERT_PATH, config.SSL_KEY_PATH)
+
+if __name__ == '__main__':
+    app.run(host=config.FLASK_HOST, port=config.FLASK_PORT, ssl_context=ssl_context)
